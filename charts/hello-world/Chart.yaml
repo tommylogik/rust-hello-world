@@ -1,0 +1,9 @@
+apiVersion: v2
+name: hello-world
+description: A Hello World Helm chart for Kubernetes
+
+type: application
+
+version: 0.0.2
+
+appVersion: "0.0.2"

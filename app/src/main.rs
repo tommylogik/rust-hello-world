@@ -5,10 +5,35 @@ use axum::{
     routing::get,
 };
 use serde::{Deserialize, Serialize};
+use tower_http::trace::TraceLayer;
+use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct ApiResponse {
     pub message: String,
+}
+
+pub fn get_subscriber<Sink>(
+    app_name: String,
+    default_env_filter: String,
+    sink: Sink,
+) -> impl tracing::Subscriber + Send + Sync
+where
+    Sink: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_env_filter));
+    let formatting_layer = BunyanFormattingLayer::new(app_name, sink);
+    Registry::default()
+        .with(env_filter)
+        .with(JsonStorageLayer)
+        .with(formatting_layer)
+}
+
+pub fn init_tracing(app_name: &str, default_env_filter: &str) {
+    let subscriber = get_subscriber(app_name.into(), default_env_filter.into(), std::io::stdout);
+    let _ = subscriber.try_init();
 }
 
 pub fn app() -> Router {
@@ -17,10 +42,13 @@ pub fn app() -> Router {
         .route("/api", get(api_hello_world))
         .route("/ws", get(ws_handler))
         .route("/websocket", get(ws_handler))
+        .layer(TraceLayer::new_for_http())
 }
 
 #[tokio::main]
 async fn main() {
+    init_tracing("hello-world", "info");
+
     let port = std::env::var("PORT").unwrap_or("3000".to_string());
     // 1. Define your API routes
     let app = app();
@@ -32,9 +60,9 @@ async fn main() {
         .unwrap();
 
     if cfg!(debug_assertions) {
-        println!("Server running on http://localhost:{port}");
+        tracing::info!("Server running on http://localhost:{port}");
     } else {
-        println!("Listening on {}", binding_address);
+        tracing::info!("Listening on {}", binding_address);
     }
 
     // 3. Start the server loop
@@ -86,6 +114,52 @@ mod tests {
         });
 
         addr
+    }
+
+    #[test]
+    fn test_bunyan_log_formatting() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for TestWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.lock().unwrap().flush()
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestWriter {
+            type Writer = TestWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TestWriter(buffer.clone());
+
+        let subscriber = get_subscriber("test-app".into(), "info".into(), writer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("Test bunyan log message");
+        });
+
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(!output.is_empty(), "Log output should not be empty");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("Output must be valid JSON");
+        assert_eq!(parsed["name"], "test-app");
+        assert_eq!(parsed["msg"], "Test bunyan log message");
+        assert_eq!(parsed["v"], 0);
+        assert_eq!(parsed["level"], 30);
+        assert!(parsed.get("time").is_some());
+        assert!(parsed.get("pid").is_some());
+        assert!(parsed.get("hostname").is_some());
     }
 
     #[tokio::test]
